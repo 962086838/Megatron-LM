@@ -101,7 +101,7 @@ from megatron.core.pipeline_parallel.utils import (
     is_vp_first_stage,
     is_vp_last_stage,
 )
-from megatron.core.optimizer import get_mup_config_overrides, get_standard_config_overrides
+from megatron.core.optimizer import get_standard_config_overrides
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.checkpointing import save_checkpoint, save_grads
 from megatron.training.checkpointing import checkpoint_exists
@@ -137,7 +137,7 @@ from megatron.core.rerun_state_machine import (
 from megatron.training.initialize import initialize_megatron
 from megatron.training.initialize import write_args_to_tensorboard
 from megatron.training.initialize import set_jit_fusion_options
-from megatron.training.utils import get_batch_on_this_cp_rank, get_batch_on_this_tp_rank, is_hybrid_model
+from megatron.training.utils import get_batch_on_this_cp_rank, get_batch_on_this_tp_rank
 from megatron.training.datasets.data_samplers import build_pretraining_data_loader
 from megatron.core.datasets.data_schedule import HybridCPDataLoaderWrapper
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
@@ -169,6 +169,7 @@ from megatron.core.num_microbatches_calculator import (
     get_num_microbatches,
     update_num_microbatches
 )
+from megatron.core.datasets.data_schedule import wrap_data_iterator
 
 from .async_utils import maybe_finalize_async_save
 from .utils import (
@@ -225,45 +226,68 @@ def print_datetime(string, override_timestamp=None):
         time_str = datetime.fromtimestamp(override_timestamp).strftime('%Y-%m-%d %H:%M:%S.%f')
     print_rank_0(f'[{string}] datetime: {time_str} ')
 
-def num_floating_point_operations(args, batch_size):
-    def mlp_layer_flops(batch_size, seq_len, hidden_size, expansion=4.0, swiglu=False):
+def num_floating_point_operations(args, seqlen_sum_this_global_batch, seqlen_squared_sum_this_global_batch):
+    def calculate_layer_counts():
+        """Calculate the number of attention, Mamba, and MLP layers."""
+        if args.hybrid_override_pattern:
+            from megatron.core.ssm.mamba_hybrid_layer_allocation import parse_hybrid_pattern
+            # Parse unified pattern to separate main and MTP components
+            parsed = parse_hybrid_pattern(args.hybrid_override_pattern)
+            counts = {'M': 0, '*': 0, '-': 0, 'E': 0}
+            # Count main decoder layers
+            if parsed.main_pattern:
+                for layer_type in parsed.main_pattern:
+                    if layer_type in counts:
+                        counts[layer_type] += 1
+            # Count MTP layers (pattern repeated mtp_num_depths times)
+            if parsed.mtp_pattern and parsed.mtp_num_depths > 0:
+                for layer_type in parsed.mtp_pattern:
+                    if layer_type in counts:
+                        counts[layer_type] += parsed.mtp_num_depths
+            return counts['*'], counts['M'], counts['-'], counts['E']
+        else:
+            num_attn_layers = round(args.num_layers * args.hybrid_attention_ratio)
+            num_mlp_layers = round(args.num_layers * args.hybrid_mlp_ratio)
+            num_mamba_layers = args.num_layers - num_attn_layers - num_mlp_layers
+            num_moe_layers = 0
+            return num_attn_layers, num_mamba_layers, num_mlp_layers, num_moe_layers
+
+    def mlp_layer_flops(seqlen_sum_this_global_batch, hidden_size, expansion=4.0, swiglu=False):
         """Calculate FLOPs for an MLP layer."""
         scale_factor = 3.0 / 2.0 if swiglu else 1.0
-        return 4 * expansion * scale_factor * batch_size * seq_len * hidden_size**2
+        return 4 * expansion * scale_factor * seqlen_sum_this_global_batch * hidden_size**2
 
-    def moe_layer_flops(batch_size, seq_len, hidden_size, moe_ffn_hidden_size,
+    def moe_layer_flops(seqlen_sum_this_global_batch, hidden_size, moe_ffn_hidden_size,
                         shared_expert_ffn_hidden_size, num_experts_routed_to,
                         moe_latent_size=None, swiglu=False):
         """Calculate FLOPs for an MoE layer."""
         scale_factor = 3.0 / 2.0 if swiglu else 1.0
         if moe_latent_size is None:
-            routed_flops = (4 * batch_size * seq_len * hidden_size *
+            routed_flops = (4 * seqlen_sum_this_global_batch * hidden_size *
                             moe_ffn_hidden_size * num_experts_routed_to * scale_factor)
         else:
             # Routed experts run on moe_latent_size.
-            routed_flops = (4 * batch_size * seq_len * moe_latent_size *
+            routed_flops = (4 * seqlen_sum_this_global_batch * moe_latent_size *
                             moe_ffn_hidden_size * num_experts_routed_to * scale_factor)
             # Up proj and down proj.
-            routed_flops += (4 * batch_size * seq_len * hidden_size * moe_latent_size)
-        shared_flops = 4 * batch_size * seq_len * hidden_size * shared_expert_ffn_hidden_size * scale_factor
+            routed_flops += (4 * seqlen_sum_this_global_batch * hidden_size * moe_latent_size)
+        shared_flops = 4 * seqlen_sum_this_global_batch * hidden_size * shared_expert_ffn_hidden_size * scale_factor
         return routed_flops + shared_flops
 
     def attn_layer_flops(
-        batch_size, seq_len, hidden_size, num_heads, gqa=True, gqa_groups=8, kv_channels=None
+        seqlen_sum_this_global_batch, seqlen_squared_sum_this_global_batch, hidden_size, num_heads, gqa=True, gqa_groups=8, kv_channels=None
     ):
         """Calculate FLOPs for an attention layer."""
         p = (kv_channels * num_heads / hidden_size) if kv_channels else 1
         g = gqa_groups if gqa else num_heads
         return (
             4
-            * batch_size
-            * seq_len
             * hidden_size
             * p
-            * (hidden_size + (hidden_size * (g / num_heads)) + (seq_len / 2))
+            * (hidden_size * seqlen_sum_this_global_batch + (hidden_size * (g / num_heads)) * seqlen_sum_this_global_batch + (seqlen_squared_sum_this_global_batch / 2))
         )
 
-    def mamba_layer_flops(batch_size, seq_len, hidden_size, state_dim=16,
+    def mamba_layer_flops(seqlen_sum_this_global_batch, hidden_size, state_dim=16,
                           head_dim=64, num_groups=1, num_heads=128):
         """Calculate FLOPs for a Mamba layer."""
         # Note (rwaleffe): flops estimate for scan should be updated based on new SSD kernels,
@@ -276,16 +300,15 @@ def num_floating_point_operations(args, batch_size):
         return (
             (
                 2
-                * batch_size
-                * seq_len
+                * seqlen_sum_this_global_batch
                 * hidden_size
                 * (2 * d_in + 2 * num_groups * state_dim + nheads)
             )  # in_proj
-            + (7 * batch_size * seq_len * d_in * state_dim)  # scan
-            + (2 * batch_size * seq_len * d_in * hidden_size)  # out_proj
+            + (7 * seqlen_sum_this_global_batch * d_in * state_dim)  # scan
+            + (2 * seqlen_sum_this_global_batch * d_in * hidden_size)  # out_proj
         )
 
-    def hybrid_flops(batch_size, seq_len, hidden_size,
+    def hybrid_flops(seqlen_sum_this_global_batch, seqlen_squared_sum_this_global_batch, hidden_size,
                      num_attn_layers, num_mamba_layers, num_mlp_layers, num_moe_layers,
                      mamba_state_dim=128, mamba_head_dim=64,
                      mamba_num_groups=8, mamba_num_heads=128,
@@ -297,17 +320,17 @@ def num_floating_point_operations(args, batch_size):
                      vocab_size=256000, mtp_num_layers=0):
         """Calculate total FLOPs for the hybrid model."""
         flops_fwd = (
-                num_attn_layers * attn_layer_flops(batch_size, seq_len, hidden_size,
+                num_attn_layers * attn_layer_flops(seqlen_sum_this_global_batch, seqlen_squared_sum_this_global_batch, hidden_size,
                                                    num_attn_heads, gqa, gqa_groups, kv_channels) +
-                num_mlp_layers * mlp_layer_flops(batch_size, seq_len, hidden_size,
+                num_mlp_layers * mlp_layer_flops(seqlen_sum_this_global_batch, hidden_size,
                                                  mlp_expansion, swiglu) +
-                num_mamba_layers * mamba_layer_flops(batch_size, seq_len, hidden_size,
+                num_mamba_layers * mamba_layer_flops(seqlen_sum_this_global_batch, hidden_size,
                                                      mamba_state_dim, mamba_head_dim,
                                                      mamba_num_groups, mamba_num_heads) +
-                num_moe_layers * moe_layer_flops(batch_size, seq_len, hidden_size, moe_ffn_hidden_size,
+                num_moe_layers * moe_layer_flops(seqlen_sum_this_global_batch, hidden_size, moe_ffn_hidden_size,
                                                  shared_expert_ffn_hidden_size, num_experts_routed_to,
                                                  moe_latent_size, swiglu) +
-                (2 * batch_size * seq_len * hidden_size * vocab_size * (1 + mtp_num_layers))  # logits computation
+                (2 * seqlen_sum_this_global_batch * hidden_size * vocab_size * (1 + mtp_num_layers))  # logits computation
         )
         return flops_fwd * 3
 
@@ -378,13 +401,18 @@ def num_floating_point_operations(args, batch_size):
             assert not args.group_query_attention
             '''
             Basic arithmetic
-            let B is batch size, s is seq_len, h is embedding dim,
-            for one self_attnetion block (prenorm is not included)
-            qkv projection:  6Bsh^2
-            attn:            2Bs^2h
-            attn over value: 2Bs^2h
-            oproj:           2Bsh^2
+            
+            Let h be the embedding dim.
+            We use two statistics to unify BSHD and THD cases:
+                seqlen_sum_this_global_batch: total number of tokens in this global batch
+                seqlen_squared_sum_this_global_batch: sum of squared sequence lengths in this global batch
 
+            For one self-attention block (prenorm not included):
+                qkv projection:      6 * seqlen_sum_this_global_batch * h^2
+                attn:    2 * seqlen_squared_sum_this_global_batch * h
+                attn over value:   2 * seqlen_squared_sum_this_global_batch * h
+                oproj:   2 * seqlen_sum_this_global_batch * h^2
+            
             references
             https://arxiv.org/abs/2305.10403
             https://arxiv.org/abs/2205.05198
@@ -405,7 +433,7 @@ def num_floating_point_operations(args, batch_size):
             standard_self_attn_term = (
                 forward_backward_expansion_factor
                 * fma_expansion_factor
-                * (
+                * ( seqlen_sum_this_global_batch * (
                     ## q lora + rope + q norm
                     q_term
                     ## kv lora + rope + kv norm
@@ -417,12 +445,12 @@ def num_floating_point_operations(args, batch_size):
                     )
                     + args.hidden_size * args.qk_pos_emb_head_dim
                     ## o proj
-                    + (args.num_attention_heads * args.v_head_dim) * args.hidden_size
+                    + (args.num_attention_heads * args.v_head_dim) * args.hidden_size)
                     ## core attn
-                    + args.seq_length
+                    + seqlen_squared_sum_this_global_batch
                     * (args.num_attention_heads * (args.qk_head_dim + args.qk_pos_emb_head_dim))
-                    / 2  # causal mask (only half of the mask is non-zero)
-                    + args.seq_length * args.num_attention_heads * args.v_head_dim / 2
+                    / 2 # causal mask (only half of the mask is non-zero)
+                    + seqlen_squared_sum_this_global_batch * args.num_attention_heads * args.v_head_dim / 2
                 )
             )
 
@@ -435,7 +463,7 @@ def num_floating_point_operations(args, batch_size):
             standard_self_attn_term = (
                 forward_backward_expansion_factor
                 * fma_expansion_factor
-                * (
+                * ( seqlen_sum_this_global_batch *(
                     ## qkv proj
                     args.hidden_size
                     * (
@@ -443,14 +471,14 @@ def num_floating_point_operations(args, batch_size):
                         + key_projection_size
                         + value_projection_size
                         + gate_projection_size
-                    )
+                    ))
                     ## core attention
                     + query_projection_size
-                    * args.seq_length
+                    * seqlen_squared_sum_this_global_batch
                     / 2  # causal mask (only half of the mask is non-zero)
                     * 2  # QK^T and (QK^T)V
                     ## out proj
-                    + query_projection_size
+                    + seqlen_sum_this_global_batch * query_projection_size
                     * args.hidden_size
                 )
             )
@@ -511,7 +539,7 @@ def num_floating_point_operations(args, batch_size):
                         + args.hidden_size
                         * v_dim
                     )
-                )
+                ) * seqlen_sum_this_global_batch
             else:
                 raise ValueError(
                     "Invalid experimental_attention_variant: "
@@ -528,8 +556,7 @@ def num_floating_point_operations(args, batch_size):
         )
 
         total_floating_point_operations = (
-            batch_size
-            * args.seq_length
+            seqlen_sum_this_global_batch
             * (
                 # MLP
                 forward_backward_expansion_factor
@@ -559,8 +586,6 @@ def num_floating_point_operations(args, batch_size):
                     + (shared_expert_ffn_hidden_size * ffn_expansion_factor)
                     * num_moe_layers
                 )
-                # Self Attention
-                + self_attn_term
                 # MTP norms and proj
                 + forward_backward_expansion_factor
                 * fma_expansion_factor
@@ -578,26 +603,25 @@ def num_floating_point_operations(args, batch_size):
                 * args.padded_vocab_size
                 * (mtp_num_layers + 1)  # MTP + final logit
             )
+            +                
+            # Self Attention
+            self_attn_term
+            
         )
         return total_floating_point_operations
 
     # Main entrypoint for FLOPs calculation.
-    if is_hybrid_model(args):
+    if args.is_hybrid_model:
         # Calculate the number of each type of layer.
-        from operator import itemgetter
-
-        from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols, get_hybrid_layer_counts
-        num_attn_layers, num_mamba_layers, num_mlp_layers, num_moe_layers = itemgetter(
-            Symbols.ATTENTION, Symbols.MAMBA, Symbols.MLP, Symbols.MOE
-        )(get_hybrid_layer_counts(args.hybrid_layer_pattern))
+        num_attn_layers, num_mamba_layers, num_mlp_layers, num_moe_layers = calculate_layer_counts()
 
         mtp_num_layers = args.mtp_num_layers
         if mtp_num_layers is None:
             mtp_num_layers = 0
         # Compute hybrid model FLOPs.
         return hybrid_flops(
-            batch_size=batch_size,
-            seq_len=args.seq_length,
+            seqlen_sum_this_global_batch=seqlen_sum_this_global_batch, 
+            seqlen_squared_sum_this_global_batch=seqlen_squared_sum_this_global_batch,
             hidden_size=args.hidden_size,
             num_attn_layers=num_attn_layers,
             num_mamba_layers=num_mamba_layers,
@@ -805,7 +829,9 @@ def pretrain(
             set_ideal_affinity_for_current_gpu
         )
         set_ideal_affinity_for_current_gpu()
-
+    if args.batch_invariant_mode:
+        print_rank_0("Enabling batch invariant mode globally", flush=True)
+        enable_batch_invariant_mode()
 
     if args.log_progress:
         append_to_progress_log("Starting job")
@@ -1366,7 +1392,6 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             # Set bucket_size to infinity if overlap_grad_reduce is False.
             if not ddp_config.overlap_grad_reduce:
                 ddp_config.bucket_size = None
-
         # Setup stream for ddp initialization. The side-stream may be necessary for cuda graph
         #  capture support with DDP, but we sync it with the current stream to avoid races.
         ddp_stream = torch.cuda.Stream()
@@ -1374,23 +1399,15 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         ddp_stream.wait_stream(torch.cuda.current_stream())
         # Make ddp_stream start after whatever the default stream already queued
         with torch.cuda.stream(ddp_stream):
-            # To pass kwargs unique to specific DDP classes.
-            dp_init_kwargs = {}
-            if args.use_megatron_fsdp:
-                # Also pass the mixed-precision arguments for Megatron-FSDP only.
-                dp_init_kwargs["main_params_dtype"] = args.megatron_fsdp_main_params_dtype
-                dp_init_kwargs["main_grads_dtype"] = args.megatron_fsdp_main_grads_dtype
-                dp_init_kwargs["grad_comm_dtype"] = args.megatron_fsdp_grad_comm_dtype
-
             model = [
                 DP(
                     config=config,
                     ddp_config=ddp_config,
                     module=model_chunk,
-                    # Turn off bucketing for model_chunk 2 onwards, since communication
-                    # for these model chunks is overlapped with compute anyway.
-                    disable_bucketing=(model_chunk_idx > 0) or args.overlap_param_gather_with_optimizer_step,
-                    **dp_init_kwargs,
+                    # Turn off bucketing for model_chunk 2 onwards, since communication for these
+                    # model chunks is overlapped with compute anyway.
+                    disable_bucketing=(model_chunk_idx > 0)
+                    or args.overlap_param_gather_with_optimizer_step,
                 )
                 for (model_chunk_idx, model_chunk) in enumerate(model)
             ]
@@ -1510,18 +1527,6 @@ def setup_model_and_optimizer(
     else:
         config, config_overrides = get_megatron_optimizer_config(args)
         config.timers = timers
-        if getattr(args, "use_mup", False):
-            model_config_source = (
-                unwrapped_model[0] if isinstance(unwrapped_model, list) else unwrapped_model
-            )
-            model_config = get_model_config(model_config_source)
-            mup_overrides = get_mup_config_overrides(
-                config=config,
-                mup_width_mult=model_config.mup_width_mult,
-                optimizer_type=config.optimizer,
-            )
-            if mup_overrides:
-                config_overrides = {**(config_overrides or {}), **mup_overrides}
 
         if 'muon' not in config.optimizer:
             # If the user is asking for a non-zero embedding init std, skip weight decay for embeddings
@@ -1678,6 +1683,12 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     save_wgrads_in_this_iteration = (args.save_wgrads_interval is not None and
                                      (iteration + 1) % args.save_wgrads_interval == 0)
     while rerun_state_machine.should_run_forward_backward(data_iterator):
+        # Offload optimizer states to CPU if enabled.
+        if args.offload_optimizer_states:
+            for optim_instance in optimizer.chained_optimizers:
+                if isinstance(optim_instance, DistributedOptimizer):
+                    optim_instance.offload_states()
+
         # Set grad to zero.
         for model_chunk in model:
             model_chunk.zero_grad_buffer()
@@ -1713,6 +1724,35 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                     if isinstance(optim_instance, DistributedOptimizer):
                         optim_instance._copy_main_params_to_param_buffer()
 
+        # Release GPU memory for offloaded optimizer states.
+        # This needs to be done after _copy_main_params_to_param_buffer().
+        # Separate offload and release to allow early D2H transfer to overlap with other operations.
+        if args.offload_optimizer_states:
+            for optim_instance in optimizer.chained_optimizers:
+                if isinstance(optim_instance, DistributedOptimizer):
+                    optim_instance.release_offloaded_gpu_states()
+
+        if config.sequence_packing_scheduler is not None:
+            # This wrapper is designed to support DP-balanced THD and dynamic-CP.
+            # Before wrapping, the data_iterator returns either a single sequence per get_item call, or a list where each element is a sequence.
+            # The wrapper is responsible for:
+            # 1. scheduling the sequences across ranks
+            # 2. packing them into THD format
+            # 3. broadcast flops parametes and num_microbatches to TP ranks to support unfixed num_microbatches
+            # 4. broadcast metadata(cu_seqlens, cu_seqlens_padded, max_seqlen, etc.) to PP ranks to
+            # 5. returning the packed data iterator and the FLOPs parameters
+            (
+                data_iterator,
+                num_microbatches,
+                seqlen_sum_this_global_batch,
+                seqlen_squared_sum_this_global_batch,
+            ) = wrap_data_iterator(data_iterator, config, get_num_microbatches())
+        else:
+            # data_iterator unchanged
+            num_microbatches = get_num_microbatches()
+            seqlen_sum_this_global_batch = args.seq_length * args.global_batch_size
+            seqlen_squared_sum_this_global_batch = args.seq_length ** 2 * args.global_batch_size
+
         # Forward pass.
         if save_dgrads_in_this_iteration:
             enable_dgrad_logging(model, args.save)
@@ -1720,7 +1760,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             forward_step_func=forward_step_func,
             data_iterator=data_iterator,
             model=model,
-            num_microbatches=get_num_microbatches(),
+            num_microbatches=num_microbatches,
             seq_length=args.seq_length,
             micro_batch_size=args.micro_batch_size,
             decoder_seq_length=args.decoder_seq_length,
@@ -1753,7 +1793,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
 
     should_checkpoint, should_exit, exit_code = rerun_state_machine.should_checkpoint_and_exit()
     if should_exit:
-        return {}, True, should_checkpoint, should_exit, exit_code, None, None, 0
+        return {}, True, should_checkpoint, should_exit, exit_code, None, None, 0, seqlen_sum_this_global_batch, seqlen_squared_sum_this_global_batch
 
     # Empty unused memory.
     if args.empty_unused_memory_level >= 1:
@@ -1833,8 +1873,10 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             grad_norm,
             num_zeros_in_grad,
             log_max_attention_logit,
+            seqlen_sum_this_global_batch,
+            seqlen_squared_sum_this_global_batch,
         )
-    return {}, skipped_iter, should_checkpoint, should_exit, exit_code, grad_norm, num_zeros_in_grad, log_max_attention_logit
+    return {}, skipped_iter, should_checkpoint, should_exit, exit_code, grad_norm, num_zeros_in_grad, log_max_attention_logit, seqlen_sum_this_global_batch, seqlen_squared_sum_this_global_batch
 
 
 def training_log(
@@ -1849,6 +1891,8 @@ def training_log(
     params_norm,
     num_zeros_in_grad,
     max_attention_logit,
+    seqlen_sum_this_global_batch,
+    seqlen_squared_sum_this_global_batch,
     pg_collection=None,
     is_first_iteration=False,
 ):
@@ -2033,13 +2077,8 @@ def training_log(
         if args.moe_z_loss_coeff is not None:
             track_names.append("z_loss")
 
-        if is_hybrid_model(args):
-            from operator import itemgetter
-
-            from megatron.core.ssm.mamba_hybrid_layer_allocation import (
-                Symbols, get_hybrid_layer_counts,
-            )
-            layers = itemgetter(Symbols.MOE)(get_hybrid_layer_counts(args.hybrid_layer_pattern))
+        if args.is_hybrid_model:
+            layers = args.hybrid_override_pattern.count('E')
         else:
             layers = args.num_layers
 
@@ -2064,7 +2103,6 @@ def training_log(
         MTPLossLoggingHelper.track_mtp_metrics(
             mtp_loss_scale, iteration, writer, wandb_writer, total_loss_dict
         )
-
     # Track sparse attention indexer loss.
     if args.dsa_indexer_loss_coeff is not None and args.dsa_indexer_loss_coeff > 0:
         indexer_loss_scale = 1 / get_num_microbatches()
@@ -2075,7 +2113,6 @@ def training_log(
             wandb_writer=wandb_writer,
             total_loss_dict=total_loss_dict,
         )
-
     # Dump memory snapshot and print metrics to stdout.
     if iteration % args.log_interval == 0 or is_first_iteration:
         if args.record_memory_history and (is_last_rank() or torch.distributed.get_backend() == 'fake'):
@@ -2088,7 +2125,7 @@ def training_log(
         elapsed_time = timers('interval-time').elapsed(barrier=True, reset=should_reset)
         elapsed_time_per_iteration = elapsed_time / total_iterations
 
-        throughput = num_floating_point_operations(args, batch_size) / (
+        throughput = num_floating_point_operations(args,seqlen_sum_this_global_batch, seqlen_squared_sum_this_global_batch) / (
             elapsed_time_per_iteration * 10**12 * args.world_size
         )
 
@@ -2253,7 +2290,8 @@ def save_checkpoint_and_time(
 
     # Stop timer to get accurate train interval time and exclude checkpointing duration
     timers('interval-time').stop()
-    energy_monitor.pause()
+    if args.log_energy:
+        energy_monitor.pause()
 
     # Extra barrier is added to make sure all ranks report the max time.
     timer_key = 'save-checkpoint-non-persistent' if non_persistent_ckpt else 'save-checkpoint'
@@ -2306,7 +2344,9 @@ def save_checkpoint_and_time(
         )
 
     # Recover timing
-    energy_monitor.resume()
+    if args.log_energy:
+        energy_monitor.resume()
+
     timers('interval-time', log_level=0).start(barrier=True)
 
 
@@ -2637,7 +2677,21 @@ def train(
         config.param_sync_func = [model_chunk.start_param_sync for model_chunk in model]
         if len(model) == 1:
             config.param_sync_func = config.param_sync_func[0]
-    config.finalize_model_grads_func = finalize_model_grads
+
+    # Wrap finalize_model_grads to reload offloaded optimizer states before grad finalization.
+    # This allows H2D transfer to overlap with grad all-reduce.
+    if args.offload_optimizer_states:
+
+        def finalize_model_grads_with_state_reload(*fmg_args, **fmg_kwargs):
+            # Reload offloaded states for all DistributedOptimizer instances
+            for optim_instance in optimizer.chained_optimizers:
+                if isinstance(optim_instance, DistributedOptimizer):
+                    optim_instance.reload_offloaded_states()
+            return finalize_model_grads(*fmg_args, **fmg_kwargs)
+
+        config.finalize_model_grads_func = finalize_model_grads_with_state_reload
+    else:
+        config.finalize_model_grads_func = finalize_model_grads
 
     if args.log_energy:
         energy_monitor.setup()
@@ -2839,6 +2893,8 @@ def train(
 
         # Completely skip iteration if needed.
         if iteration in args.iterations_to_skip:
+            # TODO(tailaim): this need to be modified
+            assert config.sequence_packing_scheduler is None, "Sequence packing scheduler is not supported in skip iteration mode"
             # Dummy train_step to fast forward train_data_iterator.
             dummy_train_step(train_data_iterator)
             if iteration == start_iteration:
@@ -2881,6 +2937,8 @@ def train(
             grad_norm,
             num_zeros_in_grad,
             max_attention_logit,
+            seqlen_sum_this_global_batch, 
+            seqlen_squared_sum_this_global_batch,
         ) = train_step(
             forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=iteration
         )
@@ -2968,7 +3026,7 @@ def train(
         else:
             assert num_skipped_samples_in_batch == 0
         args.skipped_train_samples += num_skipped_samples_in_batch
-        num_floating_point_operations_in_batch = num_floating_point_operations(args, batch_size)
+        num_floating_point_operations_in_batch = num_floating_point_operations(args, seqlen_sum_this_global_batch, seqlen_squared_sum_this_global_batch)
         num_floating_point_operations_so_far += num_floating_point_operations_in_batch
         num_floating_point_operations_since_last_log_event += num_floating_point_operations_in_batch
 
@@ -2994,6 +3052,8 @@ def train(
             params_norm,
             num_zeros_in_grad,
             max_attention_logit,
+            seqlen_sum_this_global_batch, 
+            seqlen_squared_sum_this_global_batch,
             pg_collection=model_pg_collection,
             is_first_iteration=is_first_iteration,
         )
@@ -3189,9 +3249,30 @@ def evaluate(
             # Don't care about timing during evaluation
             config.timers = None
             ft_integration.on_eval_step_start()
+            if config.sequence_packing_scheduler is not None:
+                # This wrapper is designed to support DP-balanced THD and dynamic-CP.
+                # Before wrapping, the data_iterator returns either a single sequence per get_item call, or a list where each element is a sequence.
+                # The wrapper is responsible for:
+                # 1. scheduling the sequences across ranks
+                # 2. packing them into THD format
+                # 3. broadcast flops parametes and num_microbatches to TP ranks to support unfixed num_microbatches
+                # 4. broadcast metadata(cu_seqlens, cu_seqlens_padded, max_seqlen, etc.) to PP ranks to
+                # 5. returning the packed data iterator and the FLOPs parameters
+                try:
+                    (
+                        packed_data_iterator,
+                        eval_num_microbatches,
+                        _,
+                        _,
+                    ) = wrap_data_iterator(data_iterator, config, eval_num_microbatches)
+                except StopIteration:
+                    # Validation data iterator exhausted, stop evaluation early.
+                    break
+            else:
+                packed_data_iterator = data_iterator
             loss_dicts = forward_backward_func(
                 forward_step_func=forward_step_func,
-                data_iterator=data_iterator,
+                data_iterator=packed_data_iterator,
                 model=model,
                 num_microbatches=eval_num_microbatches,
                 seq_length=args.seq_length,
@@ -3425,18 +3506,20 @@ def get_train_valid_test_num_samples():
     return (train_samples_in_current_phase, eval_samples, test_samples)
 
 
-def build_train_valid_test_datasets(build_train_valid_test_datasets_provider, train_valid_test_num_samples=None):
+def build_train_valid_test_datasets(build_train_valid_test_datasets_provider, train_valid_test_num_samples=None, vp_stage=None):
     """Build pretraining datasets."""
     if train_valid_test_num_samples is None:
         train_valid_test_num_samples = get_train_valid_test_num_samples()
-    print_rank_0(' > datasets target sizes (minimum size):')
     print_rank_0('    train:      {}'.format(train_valid_test_num_samples[0]))
     print_rank_0('    validation: {}'.format(train_valid_test_num_samples[1]))
     print_rank_0('    test:       {}'.format(train_valid_test_num_samples[2]))
-    return build_train_valid_test_datasets_provider(train_valid_test_num_samples)
+    if vp_stage is not None:
+        return build_train_valid_test_datasets_provider(train_valid_test_num_samples, vp_stage=vp_stage)
+    else:
+        return build_train_valid_test_datasets_provider(train_valid_test_num_samples)
 
 
-def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider):
+def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider, vp_stage=None):
     """Build pretraining data loaders."""
 
     args = get_args()
@@ -3483,7 +3566,10 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
 
         else:
             # Build datasets.
-            train_ds, valid_ds, test_ds = build_train_valid_test_datasets(build_train_valid_test_datasets_provider)
+            train_ds, valid_ds, test_ds = build_train_valid_test_datasets(
+                build_train_valid_test_datasets_provider,
+                vp_stage=vp_stage,
+            )
             valid_ds = [valid_ds] if not isinstance(valid_ds, list) else valid_ds
             if args.skip_train:
                 train_dataloader = None
@@ -3523,14 +3609,15 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
     return train_dataloader, valid_dataloaders, test_dataloader
 
 
-def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provider):
+def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provider, vp_stage=None):
     """Build pretraining data iterators."""
 
     args = get_args()
 
     # Build loaders.
     train_dataloader, valid_dataloaders, test_dataloader = build_train_valid_test_data_loaders(
-        build_train_valid_test_datasets_provider
+        build_train_valid_test_datasets_provider,
+        vp_stage=vp_stage
     )
 
     # Build iterators.

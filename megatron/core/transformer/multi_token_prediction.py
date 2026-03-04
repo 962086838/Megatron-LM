@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from __future__ import annotations
 
 import warnings
@@ -624,7 +624,6 @@ def process_mtp_loss(
     config: TransformerConfig,
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
     packed_seq_params: Optional[PackedSeqParams] = None,
-    scale_logits_fn: Optional[Callable[[Tensor], Tensor]] = None,
 ) -> Tensor:
     """Process Multi-Token Prediction (MTP) loss computation.
 
@@ -643,8 +642,6 @@ def process_mtp_loss(
         config (TransformerConfig): Model configuration containing mtp_num_layers etc.
         cp_group (Optional[ProcessGroup]): Context parallelism process group.
         packed_seq_params (Optional[PackedSeqParams]): Packed sequence parameters.
-        scale_logits_fn (Optional[Callable[[Tensor], Tensor]]): Optional function to
-            scale logits before loss computation (e.g., MuP output scaling).
 
     Returns:
         Tensor: Updated hidden states after MTP loss processing (first chunk only).
@@ -664,21 +661,28 @@ def process_mtp_loss(
     # correctly scaled relative to the main loss gradients in finalize_model_grads.
     original_num_tokens = loss_mask.sum()
 
+    fuse_linear_cross_entropy = (
+        config.cross_entropy_loss_fusion and config.cross_entropy_fusion_impl == "linear"
+    )
     for mtp_layer_number in range(config.mtp_num_layers):
-        mtp_logits, _ = output_layer(
-            hidden_states_list[mtp_layer_number + 1],
-            weight=output_weight,
-            runtime_gather_output=runtime_gather_output,
-        )
-        if scale_logits_fn is not None:
-            mtp_logits = scale_logits_fn(mtp_logits)
         mtp_labels, _ = roll_tensor(
             mtp_labels, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
         )
         loss_mask, num_tokens = roll_tensor(
             loss_mask, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
         )
-        mtp_loss = compute_language_model_loss(mtp_labels, mtp_logits)
+        output_layer_kwargs = dict(
+            input_=hidden_states_list[mtp_layer_number + 1],
+            weight=output_weight,
+            runtime_gather_output=runtime_gather_output,
+        )
+        if fuse_linear_cross_entropy:
+            mtp_loss = output_layer(
+                output_cross_entropy_loss=True, labels=mtp_labels, **output_layer_kwargs
+            )
+        else:
+            mtp_logits, _ = output_layer(**output_layer_kwargs)
+            mtp_loss = compute_language_model_loss(mtp_labels, mtp_logits)
         mtp_loss = loss_mask * mtp_loss
         if is_training:
             mtp_loss_for_log = (
@@ -814,13 +818,11 @@ class MultiTokenPredictionLayer(MegatronModule):
         # 2. GPT path: single TransformerLayer
         if mtp_layer_pattern is not None and mamba_submodules is not None:
             from megatron.core.ssm.mamba_block import MambaStack
-            from megatron.core.ssm.mamba_hybrid_layer_allocation import validate_segment_layers
 
             self.mtp_model_layer = MambaStack(
                 config=self.config,
                 submodules=mamba_submodules,
-                layer_type_list=validate_segment_layers(mtp_layer_pattern),
-                pp_layer_offset=0,
+                hybrid_override_pattern=mtp_layer_pattern,
                 pre_process=True,  # Always receives input from eh_proj
                 post_layer_norm=False,  # MTP has its own final_layernorm
                 post_process=True,  # MTP layer is self-contained

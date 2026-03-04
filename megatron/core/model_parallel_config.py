@@ -6,8 +6,11 @@ from typing import Callable, ContextManager, Literal, Optional
 
 import torch
 
+from megatron.core.utils import experimental_api
+
 
 @dataclass
+@experimental_api
 class ModelParallelConfig:
     """Base configuration for Megatron Core
 
@@ -59,7 +62,7 @@ class ModelParallelConfig:
     can handle without overflowing the memory. Typically, a good starting point is to set this
     to maximum sequence length / context parallel size.
     This is used to calculate the number and length of sub-samples assigned to 
-    each rank when using hybrid_context_parallel.
+    each rank when sequence_packing_scheduler is not None.
     """
 
     hybrid_context_parallel: bool = False
@@ -67,6 +70,12 @@ class ModelParallelConfig:
     If true, enables hybrid context parallel. This is used to balance the workload of 
     each CP rank when we use packed samples with variable sequence lengths.
     Please set max_seqlen_per_dp_cp_rank when using hybrid_context_parallel.
+    """
+
+    sequence_packing_scheduler: Optional[Literal['dp_balanced']] = None
+    """
+    Scheduler for sequence packing and hybrid context parallel.
+    dp_balanced: DP-balanced scheduler for sequence packing.
     """
 
     expert_model_parallel_size: int = 1
@@ -235,9 +244,14 @@ class ModelParallelConfig:
        Defaults to False.
     """
 
-    cross_entropy_fusion_impl: Literal['native', 'te'] = 'native'
-    """If 'native', MCore based CE loss fusion is used, if 'te', Parallel CE loss
-       from Transformer Engine library is used. Defaults to 'native'.
+    cross_entropy_fusion_impl: Literal['native', 'te', 'linear'] = 'native'
+    """
+    Specifies the implementation of cross-entropy loss fusion.
+
+    Options:
+    - 'native': Uses MCore-based cross-entropy loss fusion (default).
+    - 'te': Uses the parallel cross-entropy loss implementation from the Transformer Engine library.
+    - 'linear': Uses a linear-cross-entropy fusion approach.
     """
 
     tp_comm_overlap_disable_qkv: bool = False
